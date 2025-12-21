@@ -7,6 +7,7 @@ from climage import climage
 from PIL import Image as PILImage
 from rich.markdown import Markdown
 from rich.text import Text
+from rich.segment import Segment
 from textual import events
 from textual.app import ComposeResult
 from textual.geometry import Region
@@ -19,6 +20,8 @@ from baca.components.events import OpenThisImage
 from baca.ebooks import Ebook
 from baca.models import Config, Coordinate, SegmentType
 from baca.utils.urls import is_url
+
+from bidi.algorithm import get_display
 
 
 class Table(DataTable):
@@ -50,26 +53,69 @@ class Body(SegmentWidget):
     def __init__(self, _: Ebook, config: Config, content: str, nav_point: str | None = None):
         super().__init__(config, nav_point)
         self.content = content
+        self.nav_point = nav_point
+        self.is_rtl = bool(re.search(r'[\u0590-\u05FF]', self.content))
 
     def render(self):
-        # NOTE: Markdwon rich isn't widget, so we cannot set using css
-        # hence this translation workaround
+        align_map = dict(center="center", left="left", right="right", justify="full")
+
+        if self.is_rtl:
+            # We use 'left' to get a clean raw string for our manual calculations
+            return Markdown(self.content, justify="left")
+
+        # Original GitHub Fallback
         return Markdown(
-            self.content, justify=dict(center="center", left="left", right="right", justify="full")[self.styles.text_align]  # type: ignore
+            self.content,
+            justify=align_map[self.styles.text_align]  # type: ignore
         )
 
-    def render_line(self, y) -> Strip:
+    def render_line(self, y: int) -> Strip:
         strip = super().render_line(y)
-        for s in strip._segments:
-            if s.style is not None and s.style.link is not None:
-                link = (
-                    s.style.link
-                    if is_url(s.style.link) or self.nav_point is None
-                    else urljoin(self.nav_point, s.style.link)
-                )
-                s.style._meta = dumps({"@click": f"link({link!r})"})
-        return strip
 
+        if not self.is_rtl:
+            # Original GitHub link-processing logic
+            for s in strip._segments:
+                if s.style is not None and s.style.link is not None:
+                    link = (
+                        s.style.link
+                        if is_url(s.style.link) or self.nav_point is None
+                        else urljoin(self.nav_point, s.style.link)
+                    )
+                    s.style._meta = dumps({"@click": f"link({link!r})"})
+            return strip
+
+        # --- Hebrew Logic ---
+        line_text = "".join(seg.text for seg in strip._segments).strip()
+        if not line_text:
+            return strip
+
+        target_width = self.size.width
+        words = line_text.split()
+
+        # Accessing the alignment setting correctly via self.styles
+        use_full_justify = self.styles.text_align == "justify"
+
+        if use_full_justify and len(words) > 1 and len(line_text) > (target_width * 0.8):
+            total_chars = sum(len(w) for w in words)
+            total_spaces_needed = target_width - total_chars
+            space_slots = len(words) - 1
+            space_width = total_spaces_needed // space_slots
+            extra_spaces = total_spaces_needed % space_slots
+
+            justified_line = ""
+            for i, word in enumerate(words[:-1]):
+                current_spaces = space_width + (1 if i < extra_spaces else 0)
+                justified_line += word + (" " * current_spaces)
+            justified_line += words[-1]
+            line_text = justified_line
+        else:
+            padding_needed = target_width - len(line_text)
+            if padding_needed > 0:
+                line_text = line_text + (" " * padding_needed)
+
+        fixed_text = get_display(line_text)
+        style = strip._segments[0].style if strip._segments else None
+        return Strip([Segment(fixed_text, style)])
 
 class Image(SegmentWidget):
     def __init__(self, ebook: Ebook, config: Config, src: str, nav_point: str | None = None):
