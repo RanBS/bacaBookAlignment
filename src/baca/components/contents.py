@@ -23,7 +23,6 @@ from baca.utils.urls import is_url
 
 from bidi.algorithm import get_display
 
-
 class Table(DataTable):
     can_focus = False
 
@@ -54,7 +53,7 @@ class Body(SegmentWidget):
         super().__init__(config, nav_point)
         self.content = content
         self.nav_point = nav_point
-        self.is_rtl = bool(re.search(r'[\u0590-\u05FF]', self.content))
+        self.is_rtl = False
 
     def render(self):
         align_map = dict(center="center", left="left", right="right", justify="full")
@@ -201,6 +200,7 @@ class Content(Widget):
     def __init__(self, config: Config, ebook: Ebook):
         super().__init__()
         self.config = config
+        self.is_rtl = False
 
         self._segments: list[SegmentWidget | PrettyBody] = []
         for segment in ebook.iter_parsed_contents():
@@ -209,6 +209,12 @@ class Content(Widget):
             else:
                 component_cls = Image
             self._segments.append(component_cls(ebook, self.config, segment.content, segment.nav_point))
+
+    def set_rtl_true(self):
+        """Helper to set RTL on itself and all child segments."""
+        self.is_rtl = True
+        for segment in self._segments:
+            segment.is_rtl = True
 
     def get_navigables(self):
         return [s for s in self._segments if s.nav_point is not None]
@@ -241,28 +247,184 @@ class Content(Widget):
             accumulated_height += segment.virtual_region_with_margin.height
 
     async def search_next(
-        self, pattern_str: str, current_coord: Coordinate = Coordinate(-1, 0), forward: bool = True
+            self, pattern_str: str, current_coord: Coordinate = Coordinate(-1, 0), forward: bool = True
     ) -> Coordinate | None:
-        pattern = re.compile(pattern_str, re.IGNORECASE)
-        current_x = current_coord.x
-        line_range = (
-            range(current_coord.y, self.virtual_size.height) if forward else reversed(range(0, current_coord.y + 1))
-        )
-        for linenr in line_range:
-            line_text = self.get_text_at(linenr)
-            if line_text is not None:
-                for match in pattern.finditer(line_text):
-                    is_next_match = (match.start() > current_x) if forward else (match.start() < current_x)
-                    if is_next_match:
-                        await self.clear_search()
+        # 0. Handle Hebrew text
+        if self.is_rtl:
+            pattern_str = get_display(pattern_str)
 
-                        match_str = match.group()
+        # 1. Prepare the whitespace-agnostic pattern
+        words = pattern_str.split()
+        regex_pattern = r"\s+".join(re.escape(word) for word in words)
+        pattern = re.compile(regex_pattern, re.IGNORECASE | re.DOTALL)  # DOTALL helps match across any char
+
+        # 2. Define our buffer size
+        lookahead_buffer = 15
+
+        line_range = (
+            range(current_coord.y, self.virtual_size.height)
+            if forward else reversed(range(0, current_coord.y + 1))
+        )
+
+        for linenr in line_range:
+            # Create a single block of text from the current line + the buffer
+            # This is the "lookahead"
+            lines_to_grab = []
+            for i in range(lookahead_buffer):
+                target_line = linenr + i if forward else linenr - i
+                if 0 <= target_line < self.virtual_size.height:
+                    strip = self.get_text_at(target_line)
+                    if strip:
+                        lines_to_grab.append(strip)
+
+            chunk_text = " ".join(lines_to_grab)
+
+            if chunk_text:
+                match = pattern.search(chunk_text)
+                if match:
+                    # Coordinate logic: we only care if the match STARTS on the current 'linenr'
+                    # This prevents the search from finding the same match 50 times as we loop
+
+                    # Check if the start of the match is within the first line's length
+                    first_line_len = len(self.get_text_at(linenr) or "")
+
+                    # We only trigger the match when 'linenr' is actually the starting line of the phrase
+                    if match.start() <= first_line_len:
+                        # Skip if we are on the starting line but before the current_x
+                        if linenr == current_coord.y and match.start() <= current_coord.x:
+                            continue
+
+                        await self.clear_search()
                         match_coord = Coordinate(match.start(), linenr)
-                        match_widget = SearchMatch(match_str, match_coord)
+
+                        # Mount the highlight
+                        match_widget = SearchMatch(match.group(), match_coord)
                         await self.mount(match_widget)
                         match_widget.scroll_visible()
                         return match_coord
-            current_x = -1 if forward else self.size.width  # maybe virtual_size?
+
+        return None
+
+    def text_to_sentences(self, paragraph):
+        """
+        Splits a paragraph into a list of sentences using RegEx, treating
+        the period '.' as the primary sentence boundary.
+        """
+        # 1. Aggressive cleaning to normalize whitespace (still necessary for EPUB text)
+        # The aggressive_clean function is assumed to be defined elsewhere in your file.
+        # If it is not, replace this line with: cleaned_paragraph = ' '.join(paragraph.split())
+        cleaned_paragraph = ' '.join(paragraph.split())
+
+        # 2. RegEx for splitting by period:
+        # Pattern: Finds a period, followed by a space or the end of the string.
+        # The parentheses around the pattern '([.])' ensure the period itself is kept
+        # in the resulting list, allowing it to be attached to the sentence.
+        sentences = re.split(r'([.])\s*', cleaned_paragraph)
+
+        # 3. Reconstruct and clean the result
+        final_sentences = []
+
+        # Sentences are now in the format: [text, ., text, ., text]
+        for i in range(0, len(sentences) - 1, 2):
+            sentence_text = sentences[i].strip()
+            # Only add if there is actual text content
+            if sentence_text:
+                # Recombine the text fragment (sentences[i]) with the delimiter (sentences[i+1])
+                final_sentences.append(sentence_text + sentences[i + 1].strip())
+
+        # Handle the final fragment if it didn't end with a period
+        # (or if the last delimiter was not a period)
+        if len(sentences) % 2 != 0:
+            last_fragment = sentences[-1].strip()
+            if last_fragment:
+                final_sentences.append(last_fragment)
+
+        # Remove any empty strings that might have resulted
+        return [s for s in final_sentences if s]
+
+    def get_n_visible_sentences(
+            self, current_y: int, n: int = 5
+    ) -> str:
+        # Define lookahead (using 20 as requested to catch full sentences)
+        lookahead_buffer = 20
+
+        # Grab a chunk of text starting from this line
+        lines_to_grab = []
+        for i in range(lookahead_buffer):
+            target_line = current_y + i
+            if 0 <= target_line < self.virtual_size.height:
+                strip = self.get_text_at(target_line)
+                if strip:
+                    lines_to_grab.append(strip)
+
+        # 3. Combine lines into one paragraph
+        chunk_text = "".join(lines_to_grab)
+
+        if not chunk_text:
+            return ""
+
+        # 4. Use your custom splitter to get the list of sentences
+        all_sentences = self.text_to_sentences(chunk_text)
+
+        # 5. Return the requested sentences (skipping the first partial fragment)
+        # Using 1:n+1 to get exactly 'n' full sentences starting after the first period
+        all_sentences = " ".join(all_sentences[1:n + 1])
+
+        # handle hebrew
+        if self.is_rtl:
+            all_sentences = get_display(all_sentences)
+
+        return all_sentences
+
+    async def alignment_search(
+            self, pattern_str: str, current_coord: Coordinate, radius: int = -1
+    ) -> Coordinate | None:
+        # 0. Handle Hebrew text
+        if self.is_rtl:
+            pattern_str = get_display(pattern_str)
+
+        # Use re.escape to ensure punctuation doesn't break the regex
+        pattern = re.compile(re.escape(pattern_str), re.IGNORECASE)
+
+        # 1. Determine the search range
+        if radius == -1:
+            # Search the entire book from start to finish
+            start_line = 0
+            end_line = self.virtual_size.height
+        else:
+            # Search only the local vicinity
+            start_line = max(0, current_coord.y - radius)
+            end_line = min(current_coord.y + radius, self.virtual_size.height)
+
+        line_range = range(start_line, end_line)
+
+        # 2. Define lookahead (to catch phrases split across lines)
+        lookahead_buffer = 15
+
+        for linenr in line_range:
+            # Grab a chunk of text starting from this line
+            lines_to_grab = []
+            for i in range(lookahead_buffer):
+                target_line = linenr + i
+                if 0 <= target_line < self.virtual_size.height:
+                    strip = self.get_text_at(target_line)
+                    if strip:
+                        lines_to_grab.append(strip)
+
+            chunk_text = " ".join(lines_to_grab)
+
+            if chunk_text:
+                match = pattern.search(chunk_text)
+                if match:
+                    # We verify the match starts specifically on 'linenr'
+                    # to get the exact Coordinate
+                    first_line_len = len(self.get_text_at(linenr) or "")
+
+                    if match.start() <= first_line_len:
+                        # Return the first match found in the range
+                        return Coordinate(match.start(), linenr)
+
+        return None
 
     async def clear_search(self) -> None:
         await self.query(SearchMatch.__name__).remove()
