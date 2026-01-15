@@ -20,7 +20,7 @@ from baca.components.events import (
     Screenshot,
     SearchSubmitted,
 )
-from baca.components.windows import Alert, DictDisplay, SearchInputPrompt, ToC, contains_hebrew
+from baca.components.windows import Alert, DictDisplay, SearchInputPrompt, ToC
 from baca.config import load_config
 from baca.ebooks import Ebook
 from baca.exceptions import LaunchingFileError
