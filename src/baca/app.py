@@ -44,7 +44,7 @@ class ReadingSession:
     def __post_init__(self):
         """Runs automatically after the dataclass is initialized."""
         ebook_name = self.ebook.get_path().name
-        if contains_hebrew(ebook_name):
+        if self.contains_hebrew(ebook_name):
             self.content.set_rtl_true()
 
 
