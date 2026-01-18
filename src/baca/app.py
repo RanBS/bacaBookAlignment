@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Type
 import json
 import re
+from bidi.algorithm import get_display
 
 from textual import events
 from textual.actions import SkipAction
@@ -113,21 +114,6 @@ class Baca(App):
         self.call_after_refresh(restore_initial_state)
 
     async def action_switch_book(self) -> None:
-        def fix_points(text):
-            parts = [p.strip() for p in text.split('.') if p.strip()]
-
-            # 2. Fix each sentence and join them back
-            # We add the dot back to the logical end of each sentence before flipping
-            fixed_sentences = []
-            for sentence in parts:
-                logical_sentence = sentence + "."
-                fixed_sentences.append(logical_sentence)
-
-            # 3. Join. The order of sentences in the list will be LTR
-            final_output = " ".join(fixed_sentences)
-
-            return final_output
-
         """Instantly toggles visibility between open books."""
         if len(self.sessions) < 2:
             return
@@ -135,8 +121,7 @@ class Baca(App):
         # 0. Get visible sentences in current book before switching
         current_session = self.sessions[self.current_index]
         current_y = int(self.screen.scroll_offset.y)
-        current_session_lines = current_session.content.get_n_visible_sentences(current_y=current_y, n=4)
-        current_session_lines = fix_points(current_session_lines)
+        current_session_lines = current_session.content.get_n_visible_sentences(current_y=current_y, n=5)
 
         # 1. Save progress of current book
         if self.screen.max_scroll_y > 0:
@@ -155,13 +140,16 @@ class Baca(App):
         # 5. Alignment
         async def perform_alignment(current_session_lines):
             def get_matching_lines_from_json(lines_to_match, json_pth='matches.json'):
+                # fix hebrew lines
+                lines_to_match = get_display(lines_to_match)
+
                 # Open the file with utf-8 encoding to support Hebrew
                 with open(json_pth, 'r', encoding='utf-8') as f:
                     data = json.load(f)
 
                 # read lines from json and compare - make sure json's frame size and n are equals
                 for lines_json in data:
-                    if 'הוא טוען שהוא הרג אינקוויזיטור' in lines_json['heb']:
+                    if 'Vin sat quietly in one' in lines_json['eng']:
                         pass
                     if lines_json['eng'] == lines_to_match:
                         return lines_json['heb']
@@ -188,17 +176,17 @@ class Baca(App):
 
                 # 2. Search in a radius from current line
                 if next_session_lines:
-                    match = await next_session.content.alignment_search(
+                    match_y = await next_session.content.alignment_search(
                         pattern_str=next_session_lines,
                         current_coord=start_pos,
                         radius=1000
                     )
                 else:
-                    match = None
+                    match_y = None
 
                 # 3. Scroll result to the first line of the screen
-                if match:
-                    self.screen.scroll_to(y=match.y, animate=False)
+                if match_y:
+                    self.screen.scroll_to(y=match_y, animate=False)
                 else:
                     await self.alert(f"Couldn't align books :(")
 

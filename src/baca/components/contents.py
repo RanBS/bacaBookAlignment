@@ -1,6 +1,7 @@
 import io
 import re
 from marshal import dumps
+from typing import Any, Coroutine
 from urllib.parse import urljoin
 
 from climage import climage
@@ -44,8 +45,18 @@ class SegmentWidget(Widget):
         self.config = config
         self.nav_point = nav_point
 
-    def get_text_at(self, y: int) -> str:
-        return self.render_lines(Region(0, y, self.virtual_region_with_margin.width, 1))[0].text
+    def get_text_at(self, y: int, rtl_fix: bool = True) -> str:
+        # We store the preference on the instance temporarily
+        self._rtl_fix_override = rtl_fix
+
+        # Clear cache to ensure we don't get a stale 'visual' or 'logical' line
+        self._styles_cache.clear()
+
+        strip = self.render_lines(Region(0, y, self.virtual_region_with_margin.width, 1))[0]
+
+        # Cleanup
+        del self._rtl_fix_override
+        return strip.text
 
 
 class Body(SegmentWidget):
@@ -71,8 +82,12 @@ class Body(SegmentWidget):
     def render_line(self, y: int) -> Strip:
         strip = super().render_line(y)
 
-        if not self.is_rtl:
-            # Original GitHub link-processing logic
+        # Check if an override was provided. Default to True if not set.
+        use_rtl_fix = getattr(self, "_rtl_fix_override", True)
+
+        if not self.is_rtl or not use_rtl_fix:
+            # Skip the Hebrew flipping/justification logic
+            # Just do the standard link processing
             for s in strip._segments:
                 if s.style is not None and s.style.link is not None:
                     link = (
@@ -239,13 +254,16 @@ class Content(Widget):
     def compose(self) -> ComposeResult:
         yield from iter(self._segments)
 
-    def get_text_at(self, y: int) -> str | None:
+    def get_text_at(self, y: int, rtl_fix: bool = True) -> str | None:
         accumulated_height = 0
         for segment in self._segments:
-            if accumulated_height + segment.virtual_region_with_margin.height > y:
-                return segment.get_text_at(y - accumulated_height)
-            accumulated_height += segment.virtual_region_with_margin.height
+            segment_height = segment.virtual_region_with_margin.height
+            if accumulated_height + segment_height > y:
+                # Pass the rtl_fix argument to the segment's get_text_at
+                return segment.get_text_at(y - accumulated_height, rtl_fix=rtl_fix)
+            accumulated_height += segment_height
 
+    # TODO: see if you can not use get_display (by using rtl_fix=False in get text)
     async def search_next(
             self, pattern_str: str, current_coord: Coordinate = Coordinate(-1, 0), forward: bool = True
     ) -> Coordinate | None:
@@ -259,7 +277,7 @@ class Content(Widget):
         pattern = re.compile(regex_pattern, re.IGNORECASE | re.DOTALL)  # DOTALL helps match across any char
 
         # 2. Define our buffer size
-        lookahead_buffer = 15
+        lookahead_buffer = 10
 
         line_range = (
             range(current_coord.y, self.virtual_size.height)
@@ -346,19 +364,19 @@ class Content(Widget):
             self, current_y: int, n: int = 5
     ) -> str:
         # Define lookahead (using 20 as requested to catch full sentences)
-        lookahead_buffer = 20
+        lookahead_buffer = 10
 
         # Grab a chunk of text starting from this line
         lines_to_grab = []
         for i in range(lookahead_buffer):
             target_line = current_y + i
             if 0 <= target_line < self.virtual_size.height:
-                strip = self.get_text_at(target_line)
+                strip = self.get_text_at(target_line, rtl_fix=False)
                 if strip:
                     lines_to_grab.append(strip)
 
         # 3. Combine lines into one paragraph
-        chunk_text = "".join(lines_to_grab)
+        chunk_text = " ".join(lines_to_grab)
 
         if not chunk_text:
             return ""
@@ -378,13 +396,7 @@ class Content(Widget):
 
     async def alignment_search(
             self, pattern_str: str, current_coord: Coordinate, radius: int = -1
-    ) -> Coordinate | None:
-        # 0. Handle Hebrew text
-        if self.is_rtl:
-            pattern_str = get_display(pattern_str)
-
-        # Use re.escape to ensure punctuation doesn't break the regex
-        pattern = re.compile(re.escape(pattern_str), re.IGNORECASE)
+    ) -> int | None:
 
         # 1. Determine the search range
         if radius == -1:
@@ -399,7 +411,7 @@ class Content(Widget):
         line_range = range(start_line, end_line)
 
         # 2. Define lookahead (to catch phrases split across lines)
-        lookahead_buffer = 15
+        lookahead_buffer = 10
 
         for linenr in line_range:
             # Grab a chunk of text starting from this line
@@ -407,22 +419,20 @@ class Content(Widget):
             for i in range(lookahead_buffer):
                 target_line = linenr + i
                 if 0 <= target_line < self.virtual_size.height:
-                    strip = self.get_text_at(target_line)
+                    strip = self.get_text_at(target_line, rtl_fix=False)
                     if strip:
                         lines_to_grab.append(strip)
 
             chunk_text = " ".join(lines_to_grab)
 
-            if chunk_text:
-                match = pattern.search(chunk_text)
-                if match:
-                    # We verify the match starts specifically on 'linenr'
-                    # to get the exact Coordinate
-                    first_line_len = len(self.get_text_at(linenr) or "")
+            # 4. Use your custom splitter to get the list of sentences
+            all_sentences = self.text_to_sentences(chunk_text)
 
-                    if match.start() <= first_line_len:
-                        # Return the first match found in the range
-                        return Coordinate(match.start(), linenr)
+            n = 5
+            all_sentences = " ".join(all_sentences[1:n + 1])
+
+            if all_sentences == pattern_str:
+                return linenr
 
         return None
 
