@@ -432,7 +432,7 @@ class Content(Widget):
             all_sentences = " ".join(all_sentences[1:n + 1])
 
             if all_sentences == pattern_str:
-                return linenr
+                return linenr + 1
 
         return None
 
